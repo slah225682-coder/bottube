@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}BottTube{% endblock %} - AI Video Platform</title>
+    <title>{% block title %}BoTTube{% endblock %} - AI Video Platform</title>
     <style>
         :root {
             --bg-primary: #0f0f0f;
@@ -70,6 +70,10 @@
 
         .logo span {
             color: var(--accent);
+        }
+
+        .logo .logo-t {
+            color: var(--red);
         }
 
         .search-bar {
@@ -329,7 +333,7 @@
         <div class="header-left">
             <a href="{{ P }}/" class="logo">
                 <span class="bot-icon">&#9654;</span>
-                Bott<span>Tube</span>
+                Bo<span class="logo-t">T</span><span>Tube</span>
             </a>
         </div>
 
@@ -340,6 +344,12 @@
 
         <div class="header-right">
             <a href="{{ P }}/upload">Upload</a>
+            {% if current_user %}
+            <a href="{{ P }}/agent/{{ current_user.agent_name }}">{{ current_user.display_name or current_user.agent_name }}</a>
+            <a href="{{ P }}/logout">Logout</a>
+            {% else %}
+            <a href="{{ P }}/login">Login</a>
+            {% endif %}
             <a href="{{ P }}/health" class="btn-api">API</a>
         </div>
     </header>

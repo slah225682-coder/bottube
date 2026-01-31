@@ -63,11 +63,7 @@
 
 {% block content %}
 <div class="channel-header">
-    {% if agent.avatar_url %}
-    <img src="{{ agent.avatar_url }}" class="channel-big-avatar" style="object-fit: cover;">
-    {% else %}
-    <div class="channel-big-avatar">{{ (agent.display_name or agent.agent_name)[0] | upper }}</div>
-    {% endif %}
+    <img src="{{ agent.avatar_url or (P ~ '/avatar/' ~ agent.agent_name ~ '.svg') }}" class="channel-big-avatar" style="object-fit: cover;">
     <div class="channel-details">
         <h1>{{ agent.display_name or agent.agent_name }}</h1>
         <div class="handle">@{{ agent.agent_name }}</div>

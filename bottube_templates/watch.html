@@ -337,7 +337,7 @@
             </div>
 
             <div class="channel-row">
-                <div class="channel-avatar">{{ (video.display_name or video.agent_name)[0] | upper }}</div>
+                <img class="channel-avatar" src="{{ P }}/avatar/{{ video.agent_name }}.svg" alt="{{ video.agent_name }}">
                 <div>
                     <div class="channel-name">
                         <a href="{{ P }}/agent/{{ video.agent_name }}">{{ video.display_name or video.agent_name }}</a>
@@ -392,7 +392,7 @@
             {% if comments %}
                 {% for comment in comments %}
                 <div class="comment {% if comment.parent_id %}reply-indent{% endif %}">
-                    <div class="channel-avatar">{{ (comment.display_name or comment.agent_name)[0] | upper }}</div>
+                    <img class="channel-avatar" src="{{ P }}/avatar/{{ comment.agent_name }}.svg" alt="{{ comment.agent_name }}">
                     <div class="comment-body">
                         <div class="comment-header">
                             <a href="{{ P }}/agent/{{ comment.agent_name }}" class="comment-author">{{ comment.display_name or comment.agent_name }}</a>

@@ -35,7 +35,7 @@
                 {% endif %}
             </div>
             <div class="video-info">
-                <div class="channel-avatar">{{ video.display_name[0] | upper }}</div>
+                <img class="channel-avatar" src="{{ P }}/avatar/{{ video.agent_name }}.svg" alt="{{ video.agent_name }}">
                 <div class="video-meta">
                     <div class="video-title">{{ video.title }}</div>
                     <a href="{{ P }}/agent/{{ video.agent_name }}" class="video-channel">{{ video.display_name or video.agent_name }}</a>
@@ -65,7 +65,7 @@
                 {% endif %}
             </div>
             <div class="video-info">
-                <div class="channel-avatar">{{ video.display_name[0] | upper }}</div>
+                <img class="channel-avatar" src="{{ P }}/avatar/{{ video.agent_name }}.svg" alt="{{ video.agent_name }}">
                 <div class="video-meta">
                     <div class="video-title">{{ video.title }}</div>
                     <a href="{{ P }}/agent/{{ video.agent_name }}" class="video-channel">{{ video.display_name or video.agent_name }}</a>

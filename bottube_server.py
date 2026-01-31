@@ -23,14 +23,17 @@ from flask import (
     Flask,
     Response,
     abort,
+    flash,
     g,
     jsonify,
     redirect,
     render_template,
     request,
     send_from_directory,
+    session,
     url_for,
 )
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -42,13 +45,49 @@ VIDEO_DIR = BASE_DIR / "videos"
 THUMB_DIR = BASE_DIR / "thumbnails"
 TEMPLATE_DIR = BASE_DIR / "bottube_templates"
 
-MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500 MB
+MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500 MB upload limit
 MAX_VIDEO_DURATION = 8  # seconds - short-form content only
+MAX_VIDEO_WIDTH = 512
+MAX_VIDEO_HEIGHT = 512
+MAX_FINAL_FILE_SIZE = 1 * 1024 * 1024  # 1 MB after transcoding
+MAX_TITLE_LENGTH = 200
+MAX_DESCRIPTION_LENGTH = 2000
+MAX_BIO_LENGTH = 500
+MAX_DISPLAY_NAME_LENGTH = 64
+MAX_TAGS = 15
+MAX_TAG_LENGTH = 40
 ALLOWED_VIDEO_EXT = {".mp4", ".webm", ".avi", ".mkv", ".mov"}
 ALLOWED_THUMB_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.4.0"
 APP_START_TS = time.time()
+
+# ---------------------------------------------------------------------------
+# In-memory rate limiter (no external dependency)
+# ---------------------------------------------------------------------------
+
+_rate_buckets: dict = {}  # key -> list of timestamps
+
+
+def _rate_limit(key: str, max_requests: int, window_secs: int) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    now = time.time()
+    cutoff = now - window_secs
+    bucket = _rate_buckets.setdefault(key, [])
+    # Prune old entries
+    _rate_buckets[key] = bucket = [t for t in bucket if t > cutoff]
+    if len(bucket) >= max_requests:
+        return False
+    bucket.append(now)
+    return True
+
+
+def _get_client_ip() -> str:
+    """Get client IP, respecting X-Forwarded-For behind nginx."""
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
 
 # RTC reward amounts
 RTC_REWARD_UPLOAD = 0.05       # Uploading a video
@@ -62,6 +101,10 @@ RTC_REWARD_LIKE_RECEIVED = 0.001  # Receiving a like (paid to video creator)
 
 app = Flask(__name__, template_folder=str(TEMPLATE_DIR))
 app.config["MAX_CONTENT_LENGTH"] = MAX_VIDEO_SIZE + 10 * 1024 * 1024  # extra for form data
+app.secret_key = os.environ.get("BOTTUBE_SECRET_KEY", secrets.token_hex(32))
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["PERMANENT_SESSION_LIFETIME"] = 86400  # 24 hours
 
 # URL prefix: when behind nginx at /bottube/ on shared IP, templates need prefixed URLs.
 # When accessed via bottube.ai (own domain), prefix is empty.
@@ -70,6 +113,7 @@ DOMAIN_PREFIX = ""  # bottube.ai serves at root
 IP_PREFIX = os.environ.get("BOTTUBE_PREFIX", "/bottube").rstrip("/")
 BOTTUBE_DOMAINS = {"bottube.ai", "www.bottube.ai"}
 app.jinja_env.globals["P"] = IP_PREFIX  # default fallback
+app.jinja_env.globals["MAX_DURATION"] = MAX_VIDEO_DURATION
 
 
 @app.before_request
@@ -81,6 +125,19 @@ def set_url_prefix():
     else:
         g.prefix = IP_PREFIX
     app.jinja_env.globals["P"] = g.prefix
+
+    # Load logged-in user from session for web UI
+    g.user = None
+    user_id = session.get("user_id")
+    if user_id:
+        try:
+            db = get_db()
+            g.user = db.execute(
+                "SELECT * FROM agents WHERE id = ?", (user_id,)
+            ).fetchone()
+        except Exception:
+            pass
+    app.jinja_env.globals["current_user"] = g.user
 
 for d in (VIDEO_DIR, THUMB_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -98,6 +155,8 @@ CREATE TABLE IF NOT EXISTS agents (
     api_key TEXT UNIQUE NOT NULL,
     bio TEXT DEFAULT '',
     avatar_url TEXT DEFAULT '',
+    password_hash TEXT DEFAULT '',
+    is_human INTEGER DEFAULT 0,
     x_handle TEXT DEFAULT '',
     claim_token TEXT DEFAULT '',
     claimed INTEGER DEFAULT 0,
@@ -275,11 +334,22 @@ def video_to_dict(row):
     return d
 
 
-def agent_to_dict(row):
-    """Convert agent row to public dict (no api_key)."""
-    d = dict(row)
-    d.pop("api_key", None)
-    return d
+def agent_to_dict(row, include_private=False):
+    """Convert agent row to public-safe dict (allowlist only).
+
+    Private fields (wallet addresses, balances) only included when
+    the requesting user is viewing their own profile.
+    """
+    SAFE_FIELDS = {
+        "id", "agent_name", "display_name", "bio", "avatar_url",
+        "is_human", "x_handle", "created_at",
+    }
+    PRIVATE_FIELDS = {
+        "rtc_address", "btc_address", "eth_address", "sol_address",
+        "ltc_address", "erg_address", "paypal_email", "rtc_balance",
+    }
+    fields = SAFE_FIELDS | PRIVATE_FIELDS if include_private else SAFE_FIELDS
+    return {k: row[k] for k in fields if k in row.keys()}
 
 
 def get_video_metadata(filepath):
@@ -321,6 +391,39 @@ def generate_thumbnail(video_path, thumb_path):
         )
         return thumb_path.exists()
     except Exception:
+        return False
+
+
+def transcode_video(input_path, output_path, max_w=MAX_VIDEO_WIDTH, max_h=MAX_VIDEO_HEIGHT):
+    """Transcode video to H.264 High profile, constrained to max dimensions.
+
+    Targets ~1MB max output for 8s 512x512 clips using constrained CRF
+    with maxrate cap. Strips audio to save space on short clips.
+    """
+    try:
+        scale_filter = (
+            f"scale='min({max_w},iw)':'min({max_h},ih)'"
+            f":force_original_aspect_ratio=decrease"
+            f",pad={max_w}:{max_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+        )
+        # Target ~900kbps for 8s = ~900KB leaving room for overhead
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-vf", scale_filter,
+                "-c:v", "libx264", "-profile:v", "high",
+                "-crf", "28", "-preset", "medium",
+                "-maxrate", "900k", "-bufsize", "1800k",
+                "-pix_fmt", "yuv420p",
+                "-an",  # strip audio - short clips don't need it
+                "-movflags", "+faststart",
+                str(output_path),
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        app.logger.error(f"Transcode failed: {e}")
         return False
 
 
@@ -415,6 +518,11 @@ def health():
 @app.route("/api/register", methods=["POST"])
 def register_agent():
     """Register a new agent and return API key."""
+    # Rate limit: 5 registrations per IP per hour
+    ip = _get_client_ip()
+    if not _rate_limit(f"register:{ip}", 5, 3600):
+        return jsonify({"error": "Too many registrations. Try again later."}), 429
+
     data = request.get_json(silent=True) or {}
     agent_name = data.get("agent_name", "").strip().lower()
 
@@ -425,10 +533,18 @@ def register_agent():
             "error": "agent_name must be 2-32 chars, lowercase alphanumeric, hyphens, underscores"
         }), 400
 
-    display_name = data.get("display_name", agent_name)
-    bio = data.get("bio", "")
-    avatar_url = data.get("avatar_url", "")
-    x_handle = data.get("x_handle", "").strip().lstrip("@")
+    display_name = data.get("display_name", agent_name).strip()[:MAX_DISPLAY_NAME_LENGTH]
+    bio = data.get("bio", "").strip()[:MAX_BIO_LENGTH]
+    avatar_url = data.get("avatar_url", "").strip()
+    x_handle = data.get("x_handle", "").strip().lstrip("@")[:32]
+
+    # Validate avatar_url if provided
+    if avatar_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(avatar_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return jsonify({"error": "avatar_url must be a valid http/https URL"}), 400
+        avatar_url = avatar_url[:512]  # cap length
     api_key = gen_api_key()
     claim_token = secrets.token_hex(16)
 
@@ -514,6 +630,116 @@ def claim_page(agent_name, token):
 
 
 # ---------------------------------------------------------------------------
+# Human authentication (browser login)
+# ---------------------------------------------------------------------------
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Login page for human users."""
+    if request.method == "GET":
+        return render_template("login.html")
+
+    # Rate limit: 10 login attempts per IP per 5 minutes
+    ip = _get_client_ip()
+    if not _rate_limit(f"login:{ip}", 10, 300):
+        flash("Too many login attempts. Try again in a few minutes.", "error")
+        return render_template("login.html"), 429
+
+    username = request.form.get("username", "").strip().lower()
+    password = request.form.get("password", "")
+
+    if not username or not password:
+        flash("Username and password are required.", "error")
+        return render_template("login.html"), 400
+
+    db = get_db()
+    user = db.execute(
+        "SELECT * FROM agents WHERE agent_name = ?", (username,)
+    ).fetchone()
+
+    if not user or not user["password_hash"]:
+        flash("Invalid username or password.", "error")
+        return render_template("login.html"), 401
+
+    if not check_password_hash(user["password_hash"], password):
+        flash("Invalid username or password.", "error")
+        return render_template("login.html"), 401
+
+    session.permanent = True
+    session["user_id"] = user["id"]
+    return redirect(url_for("index"))
+
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    """Signup page for human users."""
+    if request.method == "GET":
+        return render_template("login.html", signup=True)
+
+    # Rate limit: 3 signups per IP per hour
+    ip = _get_client_ip()
+    if not _rate_limit(f"signup:{ip}", 3, 3600):
+        flash("Too many signups. Try again later.", "error")
+        return render_template("login.html", signup=True), 429
+
+    username = request.form.get("username", "").strip().lower()
+    display_name = request.form.get("display_name", "").strip()[:MAX_DISPLAY_NAME_LENGTH]
+    password = request.form.get("password", "")
+    confirm = request.form.get("confirm_password", "")
+
+    if not username or not password:
+        flash("Username and password are required.", "error")
+        return render_template("login.html", signup=True), 400
+
+    if not re.match(r"^[a-z0-9_-]{2,32}$", username):
+        flash("Username must be 2-32 chars, lowercase, alphanumeric, hyphens, underscores.", "error")
+        return render_template("login.html", signup=True), 400
+
+    if len(password) < 8:
+        flash("Password must be at least 8 characters.", "error")
+        return render_template("login.html", signup=True), 400
+
+    if password != confirm:
+        flash("Passwords do not match.", "error")
+        return render_template("login.html", signup=True), 400
+
+    api_key = gen_api_key()
+    claim_token = secrets.token_hex(16)
+
+    db = get_db()
+    try:
+        db.execute(
+            """INSERT INTO agents
+               (agent_name, display_name, api_key, password_hash, is_human,
+                bio, avatar_url, claim_token, claimed, created_at, last_active)
+               VALUES (?, ?, ?, ?, 1, '', '', ?, 0, ?, ?)""",
+            (username, display_name or username, api_key,
+             generate_password_hash(password),
+             claim_token, time.time(), time.time()),
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        flash(f"Username '{username}' is already taken.", "error")
+        return render_template("login.html", signup=True), 409
+
+    # Auto-login after signup
+    user = db.execute(
+        "SELECT id FROM agents WHERE agent_name = ?", (username,)
+    ).fetchone()
+    session.permanent = True
+    session["user_id"] = user["id"]
+
+    return redirect(url_for("index"))
+
+
+@app.route("/logout")
+def logout():
+    """Log out the current user."""
+    session.pop("user_id", None)
+    return redirect(url_for("index"))
+
+
+# ---------------------------------------------------------------------------
 # Video upload
 # ---------------------------------------------------------------------------
 
@@ -532,14 +758,18 @@ def upload_video():
     if ext not in ALLOWED_VIDEO_EXT:
         return jsonify({"error": f"Invalid video format. Allowed: {ALLOWED_VIDEO_EXT}"}), 400
 
-    title = request.form.get("title", "").strip()
+    title = request.form.get("title", "").strip()[:MAX_TITLE_LENGTH]
     if not title:
-        title = Path(video_file.filename).stem
+        title = Path(video_file.filename).stem[:MAX_TITLE_LENGTH]
 
-    description = request.form.get("description", "").strip()
-    scene_description = request.form.get("scene_description", "").strip()
+    description = request.form.get("description", "").strip()[:MAX_DESCRIPTION_LENGTH]
+    scene_description = request.form.get("scene_description", "").strip()[:MAX_DESCRIPTION_LENGTH]
     tags_raw = request.form.get("tags", "")
-    tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
+    tags = [t.strip()[:MAX_TAG_LENGTH] for t in tags_raw.split(",") if t.strip()][:MAX_TAGS]
+
+    # Rate limit: 10 uploads per agent per hour
+    if not _rate_limit(f"upload:{g.agent['id']}", 10, 3600):
+        return jsonify({"error": "Upload rate limit exceeded. Try again later."}), 429
 
     # Generate unique video ID
     video_id = gen_video_id()
@@ -561,6 +791,30 @@ def upload_video():
         return jsonify({
             "error": f"Video too long ({duration:.1f}s). Maximum duration is {MAX_VIDEO_DURATION} seconds.",
             "max_duration": MAX_VIDEO_DURATION,
+        }), 400
+
+    # Always transcode to enforce size/format constraints
+    transcoded_path = VIDEO_DIR / f"{video_id}_tc.mp4"
+    if transcode_video(video_path, transcoded_path):
+        video_path.unlink(missing_ok=True)
+        filename = f"{video_id}.mp4"
+        final_path = VIDEO_DIR / filename
+        transcoded_path.rename(final_path)
+        video_path = final_path
+        duration, width, height = get_video_metadata(final_path)
+    else:
+        video_path.unlink(missing_ok=True)
+        transcoded_path.unlink(missing_ok=True)
+        return jsonify({"error": "Video transcoding failed"}), 500
+
+    # Enforce max final file size (1 MB)
+    final_size = video_path.stat().st_size
+    if final_size > MAX_FINAL_FILE_SIZE:
+        video_path.unlink(missing_ok=True)
+        return jsonify({
+            "error": f"Video file too large after transcoding ({final_size / 1024:.0f} KB). "
+                     f"Max {MAX_FINAL_FILE_SIZE // 1024} KB. Try a shorter or simpler video.",
+            "max_file_kb": MAX_FINAL_FILE_SIZE // 1024,
         }), 400
 
     # Handle thumbnail
@@ -837,6 +1091,10 @@ def describe_video(video_id):
 @require_api_key
 def add_comment(video_id):
     """Add a comment to a video."""
+    # Rate limit: 30 comments per agent per hour
+    if not _rate_limit(f"comment:{g.agent['id']}", 30, 3600):
+        return jsonify({"error": "Comment rate limit exceeded. Try again later."}), 429
+
     db = get_db()
     video = db.execute("SELECT id FROM videos WHERE video_id = ?", (video_id,)).fetchone()
     if not video:
@@ -912,6 +1170,10 @@ def get_comments(video_id):
 @require_api_key
 def vote_video(video_id):
     """Like or dislike a video."""
+    # Rate limit: 60 votes per agent per hour
+    if not _rate_limit(f"vote:{g.agent['id']}", 60, 3600):
+        return jsonify({"error": "Vote rate limit exceeded. Try again later."}), 429
+
     db = get_db()
     video = db.execute("SELECT id, agent_id, likes, dislikes FROM videos WHERE video_id = ?", (video_id,)).fetchone()
     if not video:
@@ -1054,8 +1316,12 @@ def get_agent(agent_name):
         d["display_name"] = row["display_name"]
         video_list.append(d)
 
+    # Show private fields (wallets, balance) only to the account owner
+    is_self = (g.user and g.user["id"] == agent["id"]) or (
+        hasattr(g, "agent") and g.agent and g.agent["id"] == agent["id"]
+    )
     return jsonify({
-        "agent": agent_to_dict(agent),
+        "agent": agent_to_dict(agent, include_private=is_self),
         "videos": video_list,
         "video_count": len(video_list),
     })
@@ -1378,10 +1644,47 @@ def _post_to_x(text: str) -> str:
 # Thumbnail serving
 # ---------------------------------------------------------------------------
 
-@app.route("/thumbnails/<path:filename>")
+@app.route("/thumbnails/<filename>")
 def serve_thumbnail(filename):
     """Serve thumbnail images."""
+    if "/" in filename or "\\" in filename or ".." in filename:
+        abort(404)
     return send_from_directory(str(THUMB_DIR), filename)
+
+
+@app.route("/avatar/<agent_name>.svg")
+def serve_avatar(agent_name):
+    """Generate a unique SVG avatar based on agent name hash."""
+    h = hashlib.md5(agent_name.encode()).hexdigest()
+    hue = int(h[:3], 16) % 360
+    sat = 55 + int(h[3:5], 16) % 30
+    light = 45 + int(h[5:7], 16) % 15
+    bg = f"hsl({hue},{sat}%,{light}%)"
+    fg = f"hsl({hue},{sat}%,{min(light + 35, 95)}%)"
+    initial = (agent_name[0] if agent_name else "?").upper()
+
+    # 5x5 symmetric grid identicon
+    cells = []
+    for row in range(5):
+        for col in range(3):
+            bit = int(h[(row * 3 + col) % 32], 16) % 2
+            if bit:
+                x1 = 6 + col * 8
+                y1 = 6 + row * 8
+                cells.append(f'<rect x="{x1}" y="{y1}" width="7" height="7" rx="1" fill="{fg}" opacity="0.5"/>')
+                # Mirror
+                if col < 2:
+                    x2 = 6 + (4 - col) * 8
+                    cells.append(f'<rect x="{x2}" y="{y1}" width="7" height="7" rx="1" fill="{fg}" opacity="0.5"/>')
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <rect width="48" height="48" rx="24" fill="{bg}"/>
+  {''.join(cells)}
+  <text x="24" y="25" text-anchor="middle" dominant-baseline="central"
+        font-family="sans-serif" font-size="20" font-weight="700" fill="#fff">{initial}</text>
+</svg>'''
+    return Response(svg, mimetype="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 # ---------------------------------------------------------------------------
@@ -1515,6 +1818,12 @@ def channel(agent_name):
     )
 
 
+@app.route("/join")
+def join_page():
+    """Instructions for agents and humans to join BoTTube."""
+    return render_template("join.html")
+
+
 @app.route("/search")
 def search_page():
     """Search results page."""
@@ -1536,10 +1845,103 @@ def search_page():
     return render_template("search.html", query=q, videos=videos)
 
 
-@app.route("/upload")
+@app.route("/upload", methods=["GET", "POST"])
 def upload_page():
-    """Upload form page (for browser-based agents)."""
-    return render_template("upload.html")
+    """Upload form page for logged-in humans."""
+    if request.method == "GET":
+        return render_template("upload.html")
+
+    # Handle browser-based upload for logged-in users
+    if not g.user:
+        flash("You must be logged in to upload.", "error")
+        return redirect(url_for("login"))
+
+    if "video" not in request.files:
+        flash("No video file selected.", "error")
+        return render_template("upload.html")
+
+    video_file = request.files["video"]
+    if not video_file.filename:
+        flash("No file selected.", "error")
+        return render_template("upload.html")
+
+    ext = Path(video_file.filename).suffix.lower()
+    if ext not in ALLOWED_VIDEO_EXT:
+        flash(f"Invalid video format. Allowed: {', '.join(ALLOWED_VIDEO_EXT)}", "error")
+        return render_template("upload.html")
+
+    title = request.form.get("title", "").strip()[:MAX_TITLE_LENGTH]
+    if not title:
+        title = Path(video_file.filename).stem[:MAX_TITLE_LENGTH]
+
+    description = request.form.get("description", "").strip()[:MAX_DESCRIPTION_LENGTH]
+    tags_raw = request.form.get("tags", "")
+    tags = [t.strip()[:MAX_TAG_LENGTH] for t in tags_raw.split(",") if t.strip()][:MAX_TAGS]
+
+    video_id = gen_video_id()
+    while (VIDEO_DIR / f"{video_id}{ext}").exists():
+        video_id = gen_video_id()
+
+    filename = f"{video_id}{ext}"
+    video_path = VIDEO_DIR / filename
+    video_file.save(str(video_path))
+
+    duration, width, height = get_video_metadata(video_path)
+
+    if duration > MAX_VIDEO_DURATION:
+        video_path.unlink(missing_ok=True)
+        flash(f"Video too long ({duration:.1f}s). Max {MAX_VIDEO_DURATION} seconds.", "error")
+        return render_template("upload.html")
+
+    # Always transcode to enforce size/format constraints
+    transcoded_path = VIDEO_DIR / f"{video_id}_tc.mp4"
+    if transcode_video(video_path, transcoded_path):
+        video_path.unlink(missing_ok=True)
+        filename = f"{video_id}.mp4"
+        final_path = VIDEO_DIR / filename
+        transcoded_path.rename(final_path)
+        video_path = final_path
+        duration, width, height = get_video_metadata(final_path)
+    else:
+        video_path.unlink(missing_ok=True)
+        transcoded_path.unlink(missing_ok=True)
+        flash("Video processing failed.", "error")
+        return render_template("upload.html")
+
+    # Enforce max final file size
+    final_size = video_path.stat().st_size
+    if final_size > MAX_FINAL_FILE_SIZE:
+        video_path.unlink(missing_ok=True)
+        flash(f"Video too large after processing ({final_size // 1024} KB). Max {MAX_FINAL_FILE_SIZE // 1024} KB.", "error")
+        return render_template("upload.html")
+
+    # Thumbnail
+    thumb_filename = ""
+    if "thumbnail" in request.files and request.files["thumbnail"].filename:
+        thumb_file = request.files["thumbnail"]
+        thumb_ext = Path(thumb_file.filename).suffix.lower()
+        if thumb_ext in ALLOWED_THUMB_EXT:
+            thumb_filename = f"{video_id}{thumb_ext}"
+            thumb_file.save(str(THUMB_DIR / thumb_filename))
+    else:
+        thumb_filename = f"{video_id}.jpg"
+        final_video = VIDEO_DIR / filename
+        if not generate_thumbnail(final_video, THUMB_DIR / thumb_filename):
+            thumb_filename = ""
+
+    db = get_db()
+    db.execute(
+        """INSERT INTO videos
+           (video_id, agent_id, title, description, filename, thumbnail,
+            duration_sec, width, height, tags, scene_description, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)""",
+        (video_id, g.user["id"], title, description, filename,
+         thumb_filename, duration, width, height, json.dumps(tags), time.time()),
+    )
+    award_rtc(db, g.user["id"], RTC_REWARD_UPLOAD, "video_upload", video_id)
+    db.commit()
+
+    return redirect(f"{g.prefix}/watch/{video_id}")
 
 
 # ---------------------------------------------------------------------------

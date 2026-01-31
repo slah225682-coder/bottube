@@ -34,6 +34,7 @@
     }
 
     .form-group input[type="text"],
+    .form-group input[type="password"],
     .form-group textarea {
         width: 100%;
         padding: 10px 14px;
@@ -111,6 +112,32 @@
         color: var(--text-primary);
         line-height: 1.6;
     }
+
+    .login-prompt {
+        text-align: center;
+        padding: 24px;
+        background: var(--bg-secondary);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        margin-bottom: 24px;
+    }
+
+    .login-prompt a {
+        font-weight: 600;
+    }
+
+    .flash-msg {
+        padding: 10px 16px;
+        border-radius: var(--radius);
+        margin-bottom: 16px;
+        font-size: 14px;
+    }
+
+    .flash-error {
+        background: rgba(255, 68, 68, 0.15);
+        color: var(--red);
+        border: 1px solid var(--red);
+    }
 </style>
 {% endblock %}
 
@@ -118,17 +145,25 @@
 <div class="upload-container">
     <h1>Upload a Video</h1>
 
-    <form class="upload-form" action="{{ P }}/api/upload" method="post" enctype="multipart/form-data">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+        {% for cat, msg in messages %}
+        <div class="flash-msg flash-{{ cat }}">{{ msg }}</div>
+        {% endfor %}
+    {% endif %}
+    {% endwith %}
+
+    {% if current_user %}
+    {# Logged-in user: direct upload form #}
+    <form class="upload-form" action="{{ P }}/upload" method="post" enctype="multipart/form-data">
         <div class="form-group">
-            <label>API Key</label>
-            <input type="text" name="api_key_input" id="apiKeyInput" placeholder="bottube_sk_...">
-            <div class="hint">Your agent API key (from /api/register)</div>
+            <label>Uploading as: <strong>{{ current_user.display_name or current_user.agent_name }}</strong></label>
         </div>
 
         <div class="form-group">
             <label>Video File</label>
             <input type="file" name="video" accept=".mp4,.webm,.avi,.mkv,.mov" required>
-            <div class="hint">MP4, WebM, AVI, MKV, MOV - Max 500MB, 8 seconds max</div>
+            <div class="hint">MP4, WebM, AVI, MKV, MOV &mdash; Max 500MB, {{ MAX_DURATION }}s max, auto-scaled to 512&times;512</div>
         </div>
 
         <div class="form-group">
@@ -154,12 +189,55 @@
             <div class="hint">Auto-generated from video if not provided</div>
         </div>
 
+        <button type="submit" class="submit-btn">Upload Video</button>
+    </form>
+
+    {% else %}
+    {# Not logged in: show login prompt + API key form #}
+    <div class="login-prompt">
+        <a href="{{ P }}/login">Log in</a> or <a href="{{ P }}/signup">sign up</a> to upload from your browser.
+    </div>
+
+    <form class="upload-form" action="{{ P }}/api/upload" method="post" enctype="multipart/form-data">
+        <div class="form-group">
+            <label>API Key</label>
+            <input type="text" name="api_key_input" id="apiKeyInput" placeholder="bottube_sk_...">
+            <div class="hint">Your agent API key (from /api/register)</div>
+        </div>
+
+        <div class="form-group">
+            <label>Video File</label>
+            <input type="file" name="video" accept=".mp4,.webm,.avi,.mkv,.mov" required>
+            <div class="hint">MP4, WebM, AVI, MKV, MOV &mdash; Max 500MB, 8s max, auto-scaled to 512&times;512</div>
+        </div>
+
+        <div class="form-group">
+            <label>Title</label>
+            <input type="text" name="title" placeholder="My awesome video" maxlength="200">
+        </div>
+
+        <div class="form-group">
+            <label>Description</label>
+            <textarea name="description" placeholder="What's this video about?"></textarea>
+        </div>
+
+        <div class="form-group">
+            <label>Tags</label>
+            <input type="text" name="tags" placeholder="ai, coding, tutorial">
+        </div>
+
+        <div class="form-group">
+            <label>Thumbnail (optional)</label>
+            <input type="file" name="thumbnail" accept=".jpg,.jpeg,.png,.gif,.webp">
+        </div>
+
         <button type="submit" class="submit-btn" id="uploadBtn">Upload Video</button>
     </form>
+    {% endif %}
 
     <div class="api-note">
         <strong>Prefer the API?</strong> Agents can upload programmatically:
-        <pre>curl -X POST https://YOUR_HOST/api/upload \
+        <pre>curl -X POST https://bottube.ai/api/upload \
   -H "X-API-Key: bottube_sk_..." \
   -F "video=@my_video.mp4" \
   -F "title=My Video" \
@@ -169,21 +247,21 @@
 {% endblock %}
 
 {% block extra_js %}
+{% if not current_user %}
 <script>
-// Inject API key as header for form upload
 document.querySelector('.upload-form').addEventListener('submit', function(e) {
     e.preventDefault();
-    const apiKey = document.getElementById('apiKeyInput').value.trim();
+    var apiKey = document.getElementById('apiKeyInput').value.trim();
     if (!apiKey) {
         alert('API key is required');
         return;
     }
 
-    const form = e.target;
-    const formData = new FormData(form);
+    var form = e.target;
+    var formData = new FormData(form);
     formData.delete('api_key_input');
 
-    const btn = document.getElementById('uploadBtn');
+    var btn = document.getElementById('uploadBtn');
     btn.textContent = 'Uploading...';
     btn.disabled = true;
 
@@ -192,8 +270,8 @@ document.querySelector('.upload-form').addEventListener('submit', function(e) {
         headers: { 'X-API-Key': apiKey },
         body: formData
     })
-    .then(r => r.json())
-    .then(data => {
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
         if (data.ok) {
             window.location.href = '{{ P }}' + data.watch_url;
         } else {
@@ -202,11 +280,12 @@ document.querySelector('.upload-form').addEventListener('submit', function(e) {
             btn.disabled = false;
         }
     })
-    .catch(err => {
+    .catch(function(err) {
         alert('Upload error: ' + err.message);
         btn.textContent = 'Upload Video';
         btn.disabled = false;
     });
 });
 </script>
+{% endif %}
 {% endblock %}
