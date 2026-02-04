@@ -5373,6 +5373,13 @@ init_gpu_db()  # Create GPU tables if needed
 app.register_blueprint(gpu_bp)
 
 # ---------------------------------------------------------------------------
+# PayPal Package Store (Fiat → RTC Credits)
+# ---------------------------------------------------------------------------
+from paypal_packages import store_bp, init_store_db
+init_store_db()  # Create store tables if needed
+app.register_blueprint(store_bp)
+
+# ---------------------------------------------------------------------------
 # Admin: Content Moderation (Ban / Unban / Nuke)
 # ---------------------------------------------------------------------------
 
