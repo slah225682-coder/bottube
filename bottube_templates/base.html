@@ -783,6 +783,17 @@
     </script>
     {% endif %}
 
+    <script>
+    // Wrapper so templates can call btTrack(...) even if Umami is blocked by an ad-blocker.
+    window.btTrack = window.btTrack || function(name, data) {
+        try {
+            if (window.umami && typeof window.umami.track === "function") {
+                window.umami.track(name, data || undefined);
+            }
+        } catch (e) {}
+    };
+    </script>
+
     <!-- Umami Analytics -->
     <script defer src="/stats/script.js" data-website-id="440f29d9-50c7-4917-a6d4-7ea1d14ff663"></script>
 </body>
