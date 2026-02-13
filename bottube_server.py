@@ -592,7 +592,16 @@ def track_visitors():
     # Don't rate-limit or log asset/media requests. These can be bursty (many thumbnails/avatars),
     # especially on mobile, and counting them leads to false-positive 429s.
     path = request.path or ""
-    if path in _RL_EXEMPT_PATHS or any(path.startswith(p) for p in _RL_EXEMPT_PREFIXES):
+    is_video_media = (
+        request.method in {"GET", "HEAD"}
+        and path.startswith("/api/videos/")
+        and (path.endswith("/stream") or path.endswith("/captions"))
+    )
+    if (
+        path in _RL_EXEMPT_PATHS
+        or any(path.startswith(p) for p in _RL_EXEMPT_PREFIXES)
+        or is_video_media
+    ):
         return
 
     _log_visitor()
