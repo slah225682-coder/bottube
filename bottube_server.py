@@ -216,6 +216,19 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / max(1, len(a | b))
 
 
+def _safe_json_loads_list(raw) -> list:
+    """Best-effort JSON list parsing for DB fields (prevents 500s on bad data)."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        v = json.loads(raw)
+    except Exception:
+        return []
+    return v if isinstance(v, list) else []
+
+
 def compute_novelty_score(db, agent_id: int, title: str, description: str,
                           tags: list, scene_description: str = "") -> tuple[float, str]:
     """Compute novelty score (0-100) based on similarity to recent uploads."""
@@ -240,7 +253,7 @@ def compute_novelty_score(db, agent_id: int, title: str, description: str,
     for row in rows:
         prev_text = f"{row['title']} {row['description']} {row['scene_description']}"
         prev_tokens = _tokenize_text(prev_text)
-        prev_tags = set(json.loads(row["tags"] or "[]"))
+        prev_tags = set(_safe_json_loads_list(row["tags"]))
         sim = (0.7 * _jaccard(tokens, prev_tokens)) + (0.3 * _jaccard(tag_set, prev_tags))
         if sim > max_sim:
             max_sim = sim
@@ -2835,7 +2848,7 @@ def describe_video(video_id):
         for c in comments
     ]
 
-    tags = json.loads(row["tags"]) if row["tags"] else []
+    tags = _safe_json_loads_list(row["tags"])
 
     return jsonify({
         "video_id": row["video_id"],
@@ -3678,7 +3691,7 @@ def list_challenges():
             "challenge_id": row["challenge_id"],
             "title": row["title"],
             "description": row["description"],
-            "tags": json.loads(row["tags"] or "[]"),
+            "tags": _safe_json_loads_list(row["tags"]),
             "reward": row["reward"],
             "status": status,
             "start_at": row["start_at"],
@@ -5303,7 +5316,7 @@ def challenges_page():
             "challenge_id": row["challenge_id"],
             "title": row["title"],
             "description": row["description"],
-            "tags": json.loads(row["tags"] or "[]"),
+            "tags": _safe_json_loads_list(row["tags"]),
             "reward": row["reward"],
             "status": status,
             "start_at": row["start_at"],
@@ -8039,13 +8052,10 @@ def api_tags():
     ).fetchall()
     tag_counts = {}
     for row in rows:
-        try:
-            for t in json.loads(row["tags"]):
-                t = t.strip().lower()
-                if t:
-                    tag_counts[t] = tag_counts.get(t, 0) + 1
-        except Exception:
-            pass
+        for t in _safe_json_loads_list(row["tags"]):
+            t = str(t).strip().lower()
+            if t:
+                tag_counts[t] = tag_counts.get(t, 0) + 1
     # Sort by count descending, return top 200
     sorted_tags = sorted(tag_counts.items(), key=lambda x: -x[1])[:200]
     return jsonify({
