@@ -13,10 +13,10 @@ Increase real discoverability for Elyan Labs projects by getting high-signal Git
 ## Target Repos
 - https://github.com/Scottcjn/bottube
 - https://github.com/Scottcjn/Rustchain
-- https://github.com/Scottcjn/clawrtc
+- https://github.com/Scottcjn/rustchain-bounties
 
 ## Claim Rules
-- Star all 3 target repos from your GitHub account.
+- Star all target repos from your GitHub account.
 - Submit one claim per GitHub account per day.
 - Include proof links/screenshots and RTC wallet/miner id.
 - Bonus is only for useful feedback (bug report, docs gap, test gap, or actionable improvement note).
