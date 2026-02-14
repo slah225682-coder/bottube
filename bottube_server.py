@@ -73,6 +73,9 @@ TRENDING_AGENT_CAP = int(os.environ.get("BOTTUBE_TRENDING_AGENT_CAP", "2"))
 NOVELTY_WEIGHT = float(os.environ.get("BOTTUBE_NOVELTY_WEIGHT", "0.2"))
 NOVELTY_LOOKBACK_DAYS = int(os.environ.get("BOTTUBE_NOVELTY_LOOKBACK_DAYS", "30"))
 NOVELTY_HISTORY_LIMIT = int(os.environ.get("BOTTUBE_NOVELTY_HISTORY_LIMIT", "15"))
+# Extra penalties to keep low-effort duplicate uploads from dominating trending.
+TRENDING_PENALTY_HIGH_SIMILARITY = float(os.environ.get("BOTTUBE_TRENDING_PENALTY_HIGH_SIMILARITY", "15"))
+TRENDING_PENALTY_LOW_INFO = float(os.environ.get("BOTTUBE_TRENDING_PENALTY_LOW_INFO", "8"))
 
 # Per-category extended limits (categories not listed use defaults above)
 CATEGORY_LIMITS = {
@@ -3611,6 +3614,7 @@ def _get_trending_videos(db, limit=20):
 
     Score = (recent_views_24h * 2) + (likes * 3) + (recent_comments_24h * 4)
             + recency_bonus + (novelty_score * NOVELTY_WEIGHT)
+            + penalties (duplicate/low-info)
     recency_bonus: +10 if uploaded < 6h ago, +5 if < 24h ago
     """
     now = time.time()
@@ -3639,7 +3643,7 @@ def _get_trending_videos(db, limit=20):
                FROM comments WHERE created_at > ?
                GROUP BY video_id
            ) rc ON rc.video_id = v.video_id
-           WHERE COALESCE(a.is_banned, 0) = 0
+           WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0
            ORDER BY (
                COALESCE(rv.recent_views, 0) * 2
                + v.likes * 3
@@ -3650,10 +3654,28 @@ def _get_trending_videos(db, limit=20):
                    ELSE 0
                END
                + (v.novelty_score * ?)
+               + CASE
+                   WHEN v.novelty_flags LIKE '%high_similarity%' THEN -?
+                   ELSE 0
+               END
+               + CASE
+                   WHEN v.novelty_flags LIKE '%low_info%' THEN -?
+                   ELSE 0
+               END
            ) DESC, v.created_at DESC
            LIMIT ?""",
-        (cutoff_6h, cutoff_24h, cutoff_24h, cutoff_24h, cutoff_6h, cutoff_24h,
-         NOVELTY_WEIGHT, query_limit),
+        (
+            cutoff_6h,
+            cutoff_24h,
+            cutoff_24h,
+            cutoff_24h,
+            cutoff_6h,
+            cutoff_24h,
+            NOVELTY_WEIGHT,
+            TRENDING_PENALTY_HIGH_SIMILARITY,
+            TRENDING_PENALTY_LOW_INFO,
+            query_limit,
+        ),
     ).fetchall()
     if TRENDING_AGENT_CAP <= 0:
         return rows[:limit]
@@ -3701,7 +3723,7 @@ def feed():
     rows = db.execute(
         """SELECT v.*, a.agent_name, a.display_name, a.avatar_url
            FROM videos v JOIN agents a ON v.agent_id = a.id
-           WHERE COALESCE(a.is_banned, 0) = 0
+           WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0
            ORDER BY v.created_at DESC
            LIMIT ? OFFSET ?""",
         (per_page, offset),
@@ -5323,15 +5345,24 @@ def index():
     recent_rows = db.execute(
         """SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human
            FROM videos v JOIN agents a ON v.agent_id = a.id
+           WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0
            ORDER BY v.created_at DESC LIMIT 12""",
     ).fetchall()
 
     # Stats
     stats = {
-        "videos": db.execute("SELECT COUNT(*) FROM videos").fetchone()[0],
-        "agents": db.execute("SELECT COUNT(*) FROM agents WHERE is_human = 0").fetchone()[0],
-        "humans": db.execute("SELECT COUNT(*) FROM agents WHERE is_human = 1").fetchone()[0],
-        "views": db.execute("SELECT COALESCE(SUM(views), 0) FROM videos").fetchone()[0],
+        "videos": db.execute(
+            """SELECT COUNT(*) FROM videos v
+               JOIN agents a ON v.agent_id = a.id
+               WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0"""
+        ).fetchone()[0],
+        "agents": db.execute("SELECT COUNT(*) FROM agents WHERE is_human = 0 AND COALESCE(is_banned, 0) = 0").fetchone()[0],
+        "humans": db.execute("SELECT COUNT(*) FROM agents WHERE is_human = 1 AND COALESCE(is_banned, 0) = 0").fetchone()[0],
+        "views": db.execute(
+            """SELECT COALESCE(SUM(v.views), 0) FROM videos v
+               JOIN agents a ON v.agent_id = a.id
+               WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0"""
+        ).fetchone()[0],
     }
 
     return render_template(
@@ -6011,7 +6042,8 @@ def search_page():
         videos = db.execute(
             """SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human
                FROM videos v JOIN agents a ON v.agent_id = a.id
-               WHERE v.title LIKE ? OR v.description LIKE ? OR v.tags LIKE ? OR a.agent_name LIKE ?
+               WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0
+               AND (v.title LIKE ? OR v.description LIKE ? OR v.tags LIKE ? OR a.agent_name LIKE ?)
                ORDER BY v.views DESC, v.created_at DESC
                LIMIT 50""",
             (like_q, like_q, like_q, like_q),
@@ -6034,7 +6066,10 @@ def categories_page():
     db = get_db()
     # Count videos per category in one query
     rows = db.execute(
-        "SELECT category, COUNT(*) as cnt FROM videos GROUP BY category"
+        """SELECT v.category, COUNT(*) as cnt
+           FROM videos v JOIN agents a ON v.agent_id = a.id
+           WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0
+           GROUP BY v.category"""
     ).fetchall()
     counts = {r["category"]: r["cnt"] for r in rows}
     total = sum(counts.values())
@@ -6050,8 +6085,12 @@ def categories_page():
 def about_page():
     """About page for BoTTube / Elyan Labs."""
     db = get_db()
-    total_videos = db.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-    total_agents = db.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+    total_videos = db.execute(
+        """SELECT COUNT(*) FROM videos v
+           JOIN agents a ON v.agent_id = a.id
+           WHERE v.is_removed = 0 AND COALESCE(a.is_banned, 0) = 0"""
+    ).fetchone()[0]
+    total_agents = db.execute("SELECT COUNT(*) FROM agents WHERE COALESCE(is_banned, 0) = 0").fetchone()[0]
     return render_template(
         "about.html",
         total_videos=total_videos,
