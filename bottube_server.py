@@ -284,7 +284,8 @@ _rate_last_prune = 0.0
 _RL_WINDOW_SECS = int(os.environ.get("BOTTUBE_RL_WINDOW_SECS", "60"))
 _RL_GLOBAL_RPM = int(os.environ.get("BOTTUBE_GLOBAL_RPM", "1200"))          # per visitor cookie (requests/min)
 _RL_GLOBAL_IP_RPM = int(os.environ.get("BOTTUBE_GLOBAL_IP_RPM", "5000"))    # per IP hard-cap (requests/min)
-_RL_NOCOOKIE_RPM = int(os.environ.get("BOTTUBE_NOCOOKIE_RPM", "300"))       # per IP when no visitor cookie (requests/min)
+# Mobile carrier NAT + privacy browsers can look like "no-cookie". Keep this generous.
+_RL_NOCOOKIE_RPM = int(os.environ.get("BOTTUBE_NOCOOKIE_RPM", "2000"))      # per IP when no visitor cookie (requests/min)
 _RL_SCRAPER_RPM = int(os.environ.get("BOTTUBE_SCRAPER_RPM", "60"))          # per IP for known scraper UAs (requests/min)
 
 _RL_EXEMPT_PREFIXES = (
@@ -295,7 +296,14 @@ _RL_EXEMPT_PREFIXES = (
     "/badge/",
     "/stats/",
 )
-_RL_EXEMPT_PATHS = {"/favicon.ico", "/robots.txt", "/sitemap.xml"}
+_RL_EXEMPT_PATHS = {
+    "/favicon.ico",
+    "/robots.txt",
+    "/sitemap.xml",
+    # Client-side telemetry/counters: not worth rate-limiting, and they distort visitor logs.
+    "/api/bt-proof",
+    "/api/footer-counters",
+}
 
 
 def _rate_limit(key: str, max_requests: int, window_secs: int) -> bool:
@@ -7613,6 +7621,119 @@ def github_stats():
     except Exception:
         pass
     return jsonify(_github_cache)
+
+@app.route("/api/bt-proof", methods=["POST"])
+def bt_proof():
+    """Lightweight client telemetry ping used by base.js.
+
+    This endpoint is intentionally a no-op; it must stay fast and safe.
+    """
+    try:
+        request.get_json(silent=True)  # consume body (if any)
+    except Exception:
+        pass
+    return ("", 204)
+
+
+_footer_counters_cache = {"ts": 0.0, "data": None}
+
+def _read_download_cache() -> dict:
+    """Best-effort read of download_cache.json (written by a cron/script)."""
+    try:
+        with open(str(BASE_DIR / "download_cache.json"), "r") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def _refresh_github_repo_cache(cache: dict, repo_full_name: str) -> dict:
+    """Refresh a GitHub repo stats cache (public API, no auth) with a 5 min TTL."""
+    now = time.time()
+    if now - float(cache.get("ts", 0) or 0) < 300:
+        return cache
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{repo_full_name}")
+        req.add_header("User-Agent", "BoTTube/1.0")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read() or b"{}")
+        cache["stars"] = data.get("stargazers_count", cache.get("stars", 0))
+        cache["forks"] = data.get("forks_count", cache.get("forks", 0))
+        cache["ts"] = now
+    except Exception:
+        pass
+    return cache
+
+
+@app.route("/api/footer-counters")
+def footer_counters():
+    """Aggregated footer counters (single call) to avoid 20+ requests per page."""
+    now = time.time()
+    cached = _footer_counters_cache.get("data")
+    if cached and (now - float(_footer_counters_cache.get("ts", 0) or 0) < 60):
+        return jsonify(cached)
+
+    cache = _read_download_cache()
+
+    # Refresh GitHub caches (5 min TTL).
+    _refresh_github_repo_cache(_github_cache, "Scottcjn/bottube")
+    _refresh_github_repo_cache(_clawrtc_github_cache, "Scottcjn/Rustchain")
+    _refresh_github_repo_cache(_grazer_github_cache, "Scottcjn/grazer-skill")
+
+    data = {
+        "ts": int(now),
+        "bottube": {
+            "downloads": {
+                "clawhub": int(cache.get("clawhub", 0) or 0),
+                "npm": int(cache.get("npm", 0) or 0),
+                "pypi": int(cache.get("pypi", 0) or 0),
+            },
+            "github": {
+                "stars": int(_github_cache.get("stars", 0) or 0),
+                "forks": int(_github_cache.get("forks", 0) or 0),
+                "clones": int(_github_cache.get("clones", 0) or 0),
+            },
+            "installs": {
+                "homebrew": int(cache.get("bottube_homebrew", 0) or 0),
+                "apt": int(cache.get("bottube_apt", 0) or 0),
+                "docker": int(cache.get("bottube_docker", 0) or 0),
+            },
+        },
+        "clawrtc": {
+            "downloads": {
+                "clawhub": int(cache.get("clawrtc_clawhub", 0) or 0),
+                "npm": int(cache.get("clawrtc_npm", 0) or 0),
+                "pypi": int(cache.get("clawrtc_pypi", 0) or 0),
+            },
+            "github": {
+                "stars": int(_clawrtc_github_cache.get("stars", 0) or 0),
+                "forks": int(_clawrtc_github_cache.get("forks", 0) or 0),
+            },
+            "installs": {
+                "homebrew": int(cache.get("clawrtc_homebrew", 0) or 0),
+                "apt": int(cache.get("clawrtc_apt", 0) or 0),
+                "aur": int(cache.get("clawrtc_aur", 0) or 0),
+                "tigerbrew": int(cache.get("clawrtc_tigerbrew", 0) or 0),
+            },
+        },
+        "grazer": {
+            "downloads": {
+                "clawhub": int(cache.get("grazer_clawhub", 0) or 0),
+                "npm": int(cache.get("grazer_npm", 0) or 0),
+                "pypi": int(cache.get("grazer_pypi", 0) or 0),
+            },
+            "github": {
+                "stars": int(_grazer_github_cache.get("stars", 0) or 0),
+                "forks": int(_grazer_github_cache.get("forks", 0) or 0),
+            },
+            "installs": {
+                "homebrew": int(cache.get("grazer_homebrew", 0) or 0),
+                "apt": int(cache.get("grazer_apt", 0) or 0),
+            },
+        },
+    }
+
+    _footer_counters_cache["ts"] = now
+    _footer_counters_cache["data"] = data
+    return jsonify(data)
 
 
 

@@ -163,7 +163,7 @@
   function sendBotProofPing() {
     try {
       var x = new XMLHttpRequest();
-      x.open("POST", "/api/bt-proof", true);
+      x.open("POST", prefixPath("/api/bt-proof"), true);
       x.setRequestHeader("Content-Type", "application/json");
       x.send(JSON.stringify({
         wd: !!navigator.webdriver,
